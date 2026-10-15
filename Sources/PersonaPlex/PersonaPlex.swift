@@ -1045,6 +1045,10 @@ public final class PersonaPlexModel: Module {
     ) -> AsyncThrowingStream<RealtimeFrame, Error> {
         AsyncThrowingStream { continuation in
             let task = Task.detached(priority: .userInitiated) { [self] in
+                // One realtime session at a time: a new session waits until a cancelled one
+                // finishes its current step, since both mutate the model's KV cache and MLX state.
+                realtimeGenerationLock.lock()
+                defer { realtimeGenerationLock.unlock() }
                 do {
                     let startTime = CFAbsoluteTimeGetCurrent()
                     // 1920 samples @ 24kHz = one 80ms Mimi frame
@@ -1734,6 +1738,8 @@ public final class PersonaPlexModel: Module {
 
 
 // MARK: - Realtime text stream / steering
+
+private let realtimeGenerationLock = NSLock()
 
 /// One full-duplex step: an 80 ms agent audio frame plus its text token.
 public struct RealtimeFrame: Sendable {
