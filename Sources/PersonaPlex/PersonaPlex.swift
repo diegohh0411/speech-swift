@@ -1766,3 +1766,12 @@ public final class TextTokenInjector: @unchecked Sendable {
         return queue.isEmpty ? nil : queue.removeFirst()
     }
 }
+
+extension PersonaPlexModel {
+    /// Caps MLX's buffer cache. Without a cap the cache grows to most of RAM and
+    /// steps get ~8x slower from memory pressure; 1 GB keeps ~60 ms/step on M4 Max.
+    /// Exposed here so apps don't need a direct MLX dependency.
+    public static func setMemoryCacheLimit(bytes: Int = 1024 * 1024 * 1024) {
+        MLX.Memory.cacheLimit = bytes
+    }
+}
