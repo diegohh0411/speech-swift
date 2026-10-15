@@ -89,6 +89,62 @@ public struct RespondCommand: ParsableCommand {
     @Option(name: .long, help: "Full-duplex debug output directory (default: /tmp/personaplex_debug)")
     public var debugDir: String = "/tmp/personaplex_debug"
 
+    @Option(name: .long, help: "Full-duplex: text to force into the agent's text stream")
+    public var injectText: String?
+
+    @Option(name: .long, help: "Full-duplex: generation step at which to enqueue --inject-text")
+    public var injectAt: Int = 100
+
+    @Option(name: .long, help: "Full-duplex: padding tokens forced after each injected token")
+    public var injectPads: Int = 1
+
+    @Option(name: .long, help: "Full-duplex: OpenAI-compatible base URL of a director LLM (e.g. http://localhost:9932)")
+    public var directorURL: String?
+
+    @Option(name: .long, help: "Full-duplex: what the student said (stand-in for ASR), sent to the director")
+    public var studentText: String = ""
+
+    @Option(name: .long, help: "Full-duplex: director system prompt")
+    public var directorPrompt: String =
+        "You write the exact words a friendly math tutor says out loud next. Rules: at most two short sentences, under 30 words total. Give one small hint, then ask the student one guiding question. Never state the final answer. Spoken words only: no symbols, no formulas, no markdown."
+
+    @Option(name: .long, help: "Full-duplex: padding steps forced after the director reply (turn hold)")
+    public var holdSteps: Int = 0
+
+    @Flag(name: .long, help: "Full-duplex: force padding while waiting for the director")
+    public var thinkPads: Bool = false
+
+    enum DirectorState { case idle, thinking, speaking }
+
+    final class DirectorBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value: (String, Double)?
+        func set(_ s: String, latency: Double) { lock.lock(); value = (s, latency); lock.unlock() }
+        func get() -> (String, Double)? { lock.lock(); defer { lock.unlock() }; return value }
+    }
+
+    static func askDirector(url: String, system: String, student: String) async throws -> String {
+        var req = URLRequest(url: URL(string: url)!.appendingPathComponent("v1/chat/completions"))
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let body: [String: Any] = [
+            // LFM2.5 always reasons; an empty think block as assistant prefill skips it (~0.7 s replies).
+            "messages": [
+                ["role": "system", "content": system],
+                ["role": "user", "content": "Student says: \"\(student)\"\nTutor says:"],
+                ["role": "assistant", "content": "<think>\n</think>\n"],
+            ],
+            "temperature": 0.3, "max_tokens": 60,
+        ]
+        req.httpBody = try JSONSerialization.data(withJSONObject: body)
+        let (data, _) = try await URLSession.shared.data(for: req)
+        let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        let msg = (json?["choices"] as? [[String: Any]])?.first?["message"] as? [String: Any]
+        var text = (msg?["content"] as? String) ?? ""
+        if let r = text.range(of: "</think>") { text = String(text[r.upperBound...]) }
+        return text.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     public init() {}
 
     public func run() throws {
@@ -136,6 +192,11 @@ public struct RespondCommand: ParsableCommand {
             print("Loading PersonaPlex 7B model...")
             let model = try await PersonaPlexModel.fromPretrained(
                 modelId: modelId, progressHandler: reportProgress)
+
+            // Cap MLX's buffer cache (default 1 GB); uncapped, steps get ~8x slower.
+            let cacheMB = ProcessInfo.processInfo.environment["PP_CACHE_MB"].flatMap { Int($0) } ?? 1024
+            MLX.Memory.cacheLimit = cacheMB * 1024 * 1024
+            print("MLX cacheLimit = \(cacheMB) MB")
 
             // Apply sampling config overrides
             if let v = audioTemp { model.cfg.sampling.audioTemp = v }
@@ -211,17 +272,79 @@ public struct RespondCommand: ParsableCommand {
                     print("  Input feed complete (\(audio.count) samples)")
                 }
 
-                let stream = model.respondRealtime(
+                let injector = TextTokenInjector()
+                var injectTokens: [Int32] = []
+                if let text = injectText, let dec = spmDecoder {
+                    for tok in dec.encode(text) {
+                        injectTokens.append(tok)
+                        injectTokens += [Int32](repeating: 3, count: injectPads)
+                    }
+                    print("Will inject \(injectTokens.count) tokens at step \(injectAt): \(dec.encode(text))")
+                }
+                let stream = model.respondRealtimeFrames(
                     voice: selectedVoice,
                     systemPromptTokens: promptTokens,
                     userAudioBuffer: ringBuffer,
                     maxSteps: maxSteps,
+                    textInjector: injector,
                     verbose: verbose
                 )
 
+                var directorState: DirectorState = .idle
+                var directorReply = ""
+                let director = DirectorBox()
                 var frameCount = 0
-                for try await agentSamples in stream {
-                    responseSamples.append(contentsOf: agentSamples)
+                var stepTimes: [Double] = []
+                var lastFrameTime = CFAbsoluteTimeGetCurrent()
+                var segments: [(forced: Bool, tokens: [Int32])] = []
+                var tokenLog = ""
+                for try await frame in stream {
+                    let now = CFAbsoluteTimeGetCurrent()
+                    if frameCount > 0 { stepTimes.append((now - lastFrameTime) * 1000) }
+                    lastFrameTime = now
+                    if frameCount == injectAt && !injectTokens.isEmpty {
+                        injector.enqueue(injectTokens)  // pushed from outside the loop, like a director would
+                    }
+                    if frameCount == injectAt, let url = directorURL {
+                        // Ask the director LLM for the tutor's reply; force pads while it thinks.
+                        directorState = .thinking
+                        let reqStart = CFAbsoluteTimeGetCurrent()
+                        let student = studentText
+                        let sys = directorPrompt
+                        let box = director
+                        Task.detached {
+                            let reply = (try? await Self.askDirector(url: url, system: sys, student: student)) ?? ""
+                            box.set(reply, latency: CFAbsoluteTimeGetCurrent() - reqStart)
+                        }
+                    }
+                    if directorState == .thinking {
+                        if let (reply, latency) = director.get() {
+                            print(String(format: "Director reply after %.2fs (step %d): %@", latency, frameCount, reply))
+                            directorReply = reply
+                            injector.clear()
+                            var toks: [Int32] = []
+                            for tok in spmDecoder!.encode(reply) {
+                                toks.append(tok)
+                                toks += [Int32](repeating: 3, count: injectPads)
+                            }
+                            toks += [Int32](repeating: 3, count: holdSteps)
+                            injector.enqueue(toks)
+                            directorState = .speaking
+                        } else if thinkPads && injector.pending == 0 {
+                            injector.enqueue([3])
+                        }
+                    }
+                    responseSamples.append(contentsOf: frame.samples)
+                    textTokens.append(frame.textToken)
+                    if let last = segments.last, last.forced == frame.forced {
+                        segments[segments.count - 1].tokens.append(frame.textToken)
+                    } else {
+                        segments.append((frame.forced, [frame.textToken]))
+                    }
+                    let piece = frame.textToken == 3 ? "" : (spmDecoder?.decode([frame.textToken]) ?? "")
+                    let flag = frame.forced ? "F" : ""
+                    let rms = (frame.samples.reduce(0) { $0 + $1 * $1 } / Float(max(frame.samples.count, 1))).squareRoot()
+                    tokenLog += "\(frame.step)\t\(frame.textToken)\t\(flag)\t\(String(format: "%.4f", rms))\t\(piece)\n"
                     frameCount += 1
                     if frameCount % 25 == 0 {
                         let elapsed = CFAbsoluteTimeGetCurrent() - startTime
@@ -229,6 +352,27 @@ public struct RespondCommand: ParsableCommand {
                         print("  Frame \(frameCount): \(String(format: "%.1f", audioSec))s audio, \(String(format: "%.1f", elapsed))s elapsed")
                     }
                 }
+
+                if let dec = spmDecoder {
+                    var t = ""
+                    var stepAt = 0
+                    for seg in segments {
+                        let txt = dec.decode(seg.tokens.filter { $0 != 3 })
+                        let ts = String(format: "%.1fs", Double(stepAt) * 0.08)
+                        t += seg.forced ? " [FORCED@\(ts): \(txt)]" : " {\(ts)} \(txt)"
+                        stepAt += seg.tokens.count
+                    }
+                    print("Transcript:\(t)")
+                }
+                let sorted = stepTimes.sorted()
+                if !sorted.isEmpty {
+                    let mean = sorted.reduce(0, +) / Double(sorted.count)
+                    print(String(format: "Step time: mean %.1f ms, p50 %.1f, p95 %.1f, max %.1f (n=%d)",
+                        mean, sorted[sorted.count / 2], sorted[Int(Double(sorted.count) * 0.95)],
+                        sorted.last!, sorted.count))
+                }
+                try tokenLog.write(
+                    to: dir.appendingPathComponent("tokens.tsv"), atomically: true, encoding: .utf8)
 
                 let elapsed = CFAbsoluteTimeGetCurrent() - startTime
                 let outDuration = Double(responseSamples.count) / 24000.0

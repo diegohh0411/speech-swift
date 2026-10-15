@@ -1014,6 +1014,35 @@ public final class PersonaPlexModel: Module {
         maxSteps: Int = Int.max,
         verbose: Bool = false
     ) -> AsyncThrowingStream<[Float], Error> {
+        let frames = respondRealtimeFrames(
+            voice: voice, systemPromptTokens: systemPromptTokens,
+            userAudioBuffer: userAudioBuffer, maxSteps: maxSteps, verbose: verbose)
+        return AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    for try await frame in frames { continuation.yield(frame.samples) }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
+    /// Full-duplex generation that yields, per 80 ms step, the agent audio frame
+    /// together with the text token that drove it. If `textInjector` has queued
+    /// tokens, the next queued token replaces the sampled text token for that step
+    /// (teacher forcing of the inner-monologue stream); the depformer then
+    /// generates audio conditioned on the forced token.
+    public func respondRealtimeFrames(
+        voice: PersonaPlexVoice = .NATM0,
+        systemPromptTokens: [Int32]? = nil,
+        userAudioBuffer: AudioRingBuffer,
+        maxSteps: Int = Int.max,
+        textInjector: TextTokenInjector? = nil,
+        verbose: Bool = false
+    ) -> AsyncThrowingStream<RealtimeFrame, Error> {
         AsyncThrowingStream { continuation in
             let task = Task.detached(priority: .userInitiated) { [self] in
                 do {
@@ -1242,13 +1271,21 @@ public final class PersonaPlexModel: Module {
                         // F. Sample text token
                         let textHistory = Array(
                             allTextTokens.suffix(cfg.sampling.repetitionWindow))
-                        let textToken = sampleTextWithPenalty(
+                        var textToken = sampleTextWithPenalty(
                             logits: textLogits.squeezed(axis: 1),
                             temperature: cfg.sampling.textTemp,
                             topK: cfg.sampling.textTopK,
                             pastTokens: textHistory,
                             penalty: cfg.sampling.textRepetitionPenalty)
                         eval(textToken)
+
+                        // F'. Optional teacher forcing of the text stream
+                        var forced = false
+                        if let injected = textInjector?.next() {
+                            textToken = MLXArray([injected]).asType(textToken.dtype)
+                                .reshaped(textToken.shape)
+                            forced = true
+                        }
 
                         // G. Depformer: generate agent audio tokens
                         //    providedTokens = nil (generation mode; real mic audio is in cache)
@@ -1292,7 +1329,9 @@ public final class PersonaPlexModel: Module {
                         eval(decoded)
                         let numSamples = decoded.shape[2]
                         let flat = decoded.reshaped([numSamples])
-                        continuation.yield(flat.asArray(Float.self))
+                        continuation.yield(RealtimeFrame(
+                            samples: flat.asArray(Float.self), textToken: textVal,
+                            forced: forced, step: stepCount))
 
                         stepCount += 1
                         if verbose && stepCount % 50 == 0 {
@@ -1690,5 +1729,40 @@ public final class PersonaPlexModel: Module {
         eval(normed, logits)
 
         temporal.resetCache()
+    }
+}
+
+
+// MARK: - Realtime text stream / steering
+
+/// One full-duplex step: an 80 ms agent audio frame plus its text token.
+public struct RealtimeFrame: Sendable {
+    public let samples: [Float]
+    /// Inner-monologue text token for this step (3 = padding). Decode with `tokenizer`.
+    public let textToken: Int32
+    /// True when the token came from a `TextTokenInjector` rather than sampling.
+    public let forced: Bool
+    public let step: Int
+}
+
+/// Thread-safe FIFO of text tokens that override the sampled text token,
+/// one per generation step. Push from any thread (e.g. a director LLM).
+public final class TextTokenInjector: @unchecked Sendable {
+    private let lock = NSLock()
+    private var queue: [Int32] = []
+
+    public init() {}
+
+    public func enqueue(_ tokens: [Int32]) {
+        lock.lock(); queue.append(contentsOf: tokens); lock.unlock()
+    }
+
+    public func clear() { lock.lock(); queue.removeAll(); lock.unlock() }
+
+    public var pending: Int { lock.lock(); defer { lock.unlock() }; return queue.count }
+
+    func next() -> Int32? {
+        lock.lock(); defer { lock.unlock() }
+        return queue.isEmpty ? nil : queue.removeFirst()
     }
 }
